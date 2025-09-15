@@ -6,7 +6,7 @@ import re
 import json
 import urllib.parse
 from dataclasses import dataclass
-from typing import List, Optional, Any, Tuple
+from typing import List, Optional, Any, Tuple, Dict
 
 import requests
 from dotenv import load_dotenv
@@ -96,7 +96,7 @@ def _sim(a: str, b: str) -> float:
         return s
     return SequenceMatcher(None, norm(a), norm(b)).ratio()
 
-# ---------------- Detect URL type ----------------
+# ---------------- Detect URL type (Yandex) ----------------
 def _is_track_url(path: str) -> bool:
     return bool(re.search(r"/track/\d+", path) or re.search(r"/album/\d+/track/\d+", path))
 
@@ -106,6 +106,19 @@ def _is_artist_url(path: str) -> bool:
 def _is_album_only_url(path: str) -> bool:
     # Альбом без конкретного трека
     return bool(re.search(r"/album/\d+/?$", path))
+
+# ---------------- Detect URL type (Spotify) ----------------
+def _is_spotify_track_url(path: str) -> Optional[str]:
+    m = re.search(r"/track/([A-Za-z0-9]+)", path)
+    return m.group(1) if m else None
+
+def _is_spotify_artist_url(path: str) -> Optional[str]:
+    m = re.search(r"/artist/([A-Za-z0-9]+)", path)
+    return m.group(1) if m else None
+
+def _is_spotify_album_url(path: str) -> Optional[str]:
+    m = re.search(r"/album/([A-Za-z0-9]+)", path)
+    return m.group(1) if m else None
 
 # ---------------- Yandex: TRACK ----------------
 def _clean_track_url_and_id(url: str) -> Tuple[str, str]:
@@ -227,7 +240,7 @@ def parse_yandex_artist(url: str) -> ArtistInfo:
 
     raise RuntimeError("Could not extract artist name from Yandex.Music.")
 
-# ---------------- Yandex: ALBUM (NEW) ----------------
+# ---------------- Yandex: ALBUM ----------------
 def _clean_album_url_and_id(url: str) -> Tuple[str, str]:
     up = urllib.parse.urlparse(url)
     m = re.search(r"/album/(\d+)", up.path)
@@ -283,7 +296,7 @@ def parse_yandex_album(url: str) -> AlbumInfo:
 
     raise RuntimeError("Could not extract album data from Yandex.Music.")
 
-# ---------------- Spotify: search ----------------
+# ---------------- Spotify: search & get ----------------
 def get_spotify_token(client_id: str, client_secret: str) -> str:
     r = requests.post(
         "https://accounts.spotify.com/api/token",
@@ -348,6 +361,34 @@ def spotify_search_albums(token: str, q: str, limit: int = 10) -> List[SpotifyAl
         ))
     return out
 
+def spotify_get_track_by_id(token: str, track_id: str) -> TrackInfo:
+    r = requests.get(f"https://api.spotify.com/v1/tracks/{track_id}",
+                     headers={"Authorization": f"Bearer {token}"}, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    return TrackInfo(
+        title=j["name"],
+        artists=[a["name"] for a in j.get("artists", [])],
+        album=(j.get("album") or {}).get("name"),
+    )
+
+def spotify_get_artist_by_id(token: str, artist_id: str) -> ArtistInfo:
+    r = requests.get(f"https://api.spotify.com/v1/artists/{artist_id}",
+                     headers={"Authorization": f"Bearer {token}"}, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    return ArtistInfo(name=j["name"])
+
+def spotify_get_album_by_id(token: str, album_id: str) -> AlbumInfo:
+    r = requests.get(f"https://api.spotify.com/v1/albums/{album_id}",
+                     headers={"Authorization": f"Bearer {token}"}, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    return AlbumInfo(
+        title=j["name"],
+        artists=[a["name"] for a in j.get("artists", [])],
+    )
+
 # ---------------- Spotify: matchers ----------------
 def find_spotify_track(token: str, target: TrackInfo) -> Optional[SpotifyTrack]:
     main_artist = target.artists[0] if target.artists else ""
@@ -407,6 +448,113 @@ def find_spotify_album(token: str, target: AlbumInfo) -> Optional[SpotifyAlbum]:
           + 0.3 * max((_sim(n1, n2) for n1 in best.artists for n2 in target.artists), default=0.0)
     return best if score >= 0.66 else None
 
+# ---------------- Yandex: search (for Spotify -> Yandex) ----------------
+def _ya_search_json(query: str) -> Optional[Dict[str, Any]]:
+    endpoints = [
+        "https://music.yandex.ru/handlers/search.jsx",
+        "https://music.yandex.ru/handlers/music-search.jsx",
+    ]
+    for ep in endpoints:
+        try:
+            r = requests.get(ep, headers=YA_HEADERS_JSON,
+                             params={"text": query, "type": "all", "page": 0, "lang": "ru"},
+                             timeout=20)
+            if r.status_code == 200:
+                # иногда content-type бывает text/javascript — это ок
+                try:
+                    return r.json()
+                except Exception:
+                    try:
+                        return json.loads(r.text)
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+    return None
+
+def find_yandex_track(info: TrackInfo) -> Optional[str]:
+    # набор запросов от более точного к более свободному
+    main_artist = info.artists[0] if info.artists else ""
+    queries = [
+        f'{info.title} {main_artist} {info.album or ""}'.strip(),
+        f'{info.title} {main_artist}'.strip(),
+        f'{info.title} {" ".join(info.artists)}'.strip(),
+        f'{info.title} {info.album or ""}'.strip(),
+        f'{info.title}'.strip(),
+    ]
+    seen = set()
+    qlist = []
+    for q in queries:
+        qn = " ".join(q.split())
+        if qn and qn.lower() not in seen:
+            seen.add(qn.lower()); qlist.append(qn)
+
+    def score_track(t):
+        t_title = t.get("title") or ""
+        t_artists = _extract_names(t.get("artists") or [])
+        t_album = (t.get("albums") or [{}])[0].get("title") if t.get("albums") else ""
+        return 0.6 * _sim(info.title, t_title) + \
+               0.3 * max((_sim(a, x) for a in info.artists for x in t_artists), default=0.0) + \
+               0.1 * _sim(info.album or "", t_album or "")
+
+    for q in qlist:
+        j = _ya_search_json(q)
+        tracks = None
+        if j:
+            tracks = ((j.get("tracks") or {}).get("items")) or []
+            if not tracks and "best" in j and (j["best"] or {}).get("type") == "track":
+                tracks = [j["best"]["result"]]
+        if tracks:
+            # берём лучший, НО с жёсткой валидацией
+            best = max(tracks, key=score_track)
+            t_title = best.get("title") or ""
+            t_artists = _extract_names(best.get("artists") or [])
+            title_sim = _sim(info.title, t_title)
+            artist_sim = max((_sim(a, x) for a in info.artists for x in t_artists), default=0.0)
+            if title_sim < 0.72 or artist_sim < 0.60:
+                continue
+            tid = str(best.get("id") or "")
+            if ":" in tid:
+                tid = tid.split(":")[-1]
+            if tid.isdigit():
+                return f"https://music.yandex.ru/track/{tid}"
+    return None
+
+def find_yandex_artist(info: ArtistInfo) -> Optional[str]:
+    j = _ya_search_json(info.name)
+    if not j:
+        return None
+    artists = ((j.get("artists") or {}).get("items")) or []
+    if not artists and "best" in j and (j["best"] or {}).get("type") == "artist":
+        artists = [j["best"]["result"]]
+    if not artists:
+        return None
+    best = max(artists, key=lambda a: _sim(info.name, (a.get("name") or "")))
+    if _sim(info.name, best.get("name") or "") < 0.70:
+        return None
+    aid = str(best.get("id") or "")
+    return f"https://music.yandex.ru/artist/{aid}" if aid else None
+
+def find_yandex_album(info: AlbumInfo) -> Optional[str]:
+    q = " ".join([info.title] + info.artists).strip()
+    j = _ya_search_json(q)
+    if not j:
+        return None
+    albums = ((j.get("albums") or {}).get("items")) or []
+    if not albums and "best" in j and (j["best"] or {}).get("type") == "album":
+        albums = [j["best"]["result"]]
+    if not albums:
+        return None
+    def score(a):
+        t = a.get("title") or ""
+        ar = _extract_names(a.get("artists") or [])
+        return 0.7 * _sim(info.title, t) + 0.3 * max((_sim(x, y) for x in info.artists for y in ar), default=0.0)
+    best = max(albums, key=score)
+    if score(best) < 0.66:
+        return None
+    aid = str(best.get("id") or "")
+    return f"https://music.yandex.ru/album/{aid}" if aid else None
+
 # ---------------- Main ----------------
 def main():
     # .env рядом со скриптом
@@ -417,63 +565,138 @@ def main():
     if not client_id or not client_secret:
         raise RuntimeError("SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET not found in .env")
 
-    ya_url = input("Enter Yandex.Music URL (track / artist / album): ").strip()
-    path = urllib.parse.urlparse(ya_url).path
+    url_in = input("Enter music URL (Yandex: track/artist/album OR Spotify: track/artist/album): ").strip()
+    up = urllib.parse.urlparse(url_in)
+    host = (up.netloc or "").lower()
+    path = up.path or ""
     token = get_spotify_token(client_id, client_secret)
 
-    if _is_track_url(path):
-        # Яндекс трек → Спотифай трек
-        tinfo = parse_yandex_track(ya_url)
-        sp_t = find_spotify_track(token, tinfo)
+    try:
+        # ---------- Яндекс -> Spotify (как было) ----------
+        if "music.yandex" in host:
+            if _is_track_url(path):
+                tinfo = parse_yandex_track(url_in)
+                sp_t = find_spotify_track(token, tinfo)
 
-        print("\nParsed from Yandex.Music (Track):")
-        print(f"  Title: {tinfo.title}")
-        print(f"  Artist(s): {', '.join(tinfo.artists) if tinfo.artists else '-'}")
-        print(f"  Album: {tinfo.album or '-'}")
+                print("\nParsed from Yandex.Music (Track):")
+                print(f"  Title: {tinfo.title}")
+                print(f"  Artist(s): {', '.join(tinfo.artists) if tinfo.artists else '-'}")
+                print(f"  Album: {tinfo.album or '-'}")
 
-        if sp_t:
-            print("\nFound on Spotify (Track):")
-            print(f"  {sp_t.title} - {', '.join(sp_t.artists)}")
-            print(f"  Album: {sp_t.album or '-'}")
-            print(f"  Link: {sp_t.url}")
+                if sp_t:
+                    print("\nFound on Spotify (Track):")
+                    print(f"  {sp_t.title} - {', '.join(sp_t.artists)}")
+                    print(f"  Album: {sp_t.album or '-'}")
+                    print(f"  Link: {sp_t.url}")
+                else:
+                    print("\nNo such track on Spotify.")
+
+            elif _is_artist_url(path):
+                ainfo = parse_yandex_artist(url_in)
+                sp_a = find_spotify_artist(token, ainfo.name)
+
+                print("\nParsed from Yandex.Music (Artist):")
+                print(f"  Name: {ainfo.name}")
+
+                if sp_a:
+                    print("\nFound on Spotify (Artist):")
+                    print(f"  {sp_a.name}")
+                    print(f"  Link: https://open.spotify.com/artist/{sp_a.id}")
+                else:
+                    print("\nNo such artist on Spotify.")
+
+            elif _is_album_only_url(path):
+                try:
+                    alb = parse_yandex_album(url_in)
+                except Exception as e:
+                    print(f"\nError while parsing Yandex album: {e}")
+                    raise
+                sp_alb = find_spotify_album(token, alb)
+
+                print("\nParsed from Yandex.Music (Album):")
+                print(f"  Title: {alb.title}")
+                print(f"  Artist(s): {', '.join(alb.artists) if alb.artists else '-'}")
+
+                if sp_alb:
+                    print("\nFound on Spotify (Album):")
+                    print(f"  {sp_alb.title} - {', '.join(sp_alb.artists)}")
+                    if sp_alb.release_date:
+                        print(f"  Release: {sp_alb.release_date}")
+                    print(f"  Link: {sp_alb.url}")
+                else:
+                    print("\nNo such album on Spotify.")
+
+            else:
+                raise ValueError("Unsupported Yandex.Music URL. Provide /track/<id>, /artist/<id>, or /album/<id>.")
+
+        # ---------- Spotify -> Yandex (новое) ----------
+        elif "open.spotify.com" in host:
+            sp_tid = _is_spotify_track_url(path)
+            sp_aid = _is_spotify_artist_url(path)
+            sp_albid = _is_spotify_album_url(path)
+
+            if sp_tid:
+                try:
+                    info = spotify_get_track_by_id(token, sp_tid)
+                except Exception as e:
+                    print(f"\nError while reading Spotify track: {e}")
+                    raise
+                ya_url = find_yandex_track(info)
+
+                print("\nParsed from Spotify (Track):")
+                print(f"  Title: {info.title}")
+                print(f"  Artist(s): {', '.join(info.artists) if info.artists else '-'}")
+                print(f"  Album: {info.album or '-'}")
+
+                if ya_url:
+                    print("\nFound on Yandex.Music (Track):")
+                    print(f"  Link: {ya_url}")
+                else:
+                    print("\nNo such track on Yandex.Music.")
+
+            elif sp_aid:
+                try:
+                    info = spotify_get_artist_by_id(token, sp_aid)
+                except Exception as e:
+                    print(f"\nError while reading Spotify artist: {e}")
+                    raise
+                ya_url = find_yandex_artist(info)
+
+                print("\nParsed from Spotify (Artist):")
+                print(f"  Name: {info.name}")
+
+                if ya_url:
+                    print("\nFound on Yandex.Music (Artist):")
+                    print(f"  Link: {ya_url}")
+                else:
+                    print("\nNo such artist on Yandex.Music.")
+
+            elif sp_albid:
+                try:
+                    info = spotify_get_album_by_id(token, sp_albid)
+                except Exception as e:
+                    print(f"\nError while reading Spotify album: {e}")
+                    raise
+                ya_url = find_yandex_album(info)
+
+                print("\nParsed from Spotify (Album):")
+                print(f"  Title: {info.title}")
+                print(f"  Artist(s): {', '.join(info.artists) if info.artists else '-'}")
+
+                if ya_url:
+                    print("\nFound on Yandex.Music (Album):")
+                    print(f"  Link: {ya_url}")
+                else:
+                    print("\nNo such album on Yandex.Music.")
+
+            else:
+                raise ValueError("Unsupported Spotify URL. Provide /track/<id>, /artist/<id>, or /album/<id>.")
+
         else:
-            print("\nNo such track on Spotify.")
+            raise ValueError("Unknown host. Provide Yandex.Music or Spotify URL.")
 
-    elif _is_artist_url(path):
-        # Яндекс артист → Спотифай артист
-        ainfo = parse_yandex_artist(ya_url)
-        sp_a = find_spotify_artist(token, ainfo.name)
-
-        print("\nParsed from Yandex.Music (Artist):")
-        print(f"  Name: {ainfo.name}")
-
-        if sp_a:
-            print("\nFound on Spotify (Artist):")
-            print(f"  {sp_a.name}")
-            print(f"  Link: https://open.spotify.com/artist/{sp_a.id}")
-        else:
-            print("\nNo such artist on Spotify.")
-
-    elif _is_album_only_url(path):
-        # Яндекс альбом → Спотифай альбом
-        alb = parse_yandex_album(ya_url)
-        sp_alb = find_spotify_album(token, alb)
-
-        print("\nParsed from Yandex.Music (Album):")
-        print(f"  Title: {alb.title}")
-        print(f"  Artist(s): {', '.join(alb.artists) if alb.artists else '-'}")
-
-        if sp_alb:
-            print("\nFound on Spotify (Album):")
-            print(f"  {sp_alb.title} - {', '.join(sp_alb.artists)}")
-            if sp_alb.release_date:
-                print(f"  Release: {sp_alb.release_date}")
-            print(f"  Link: {sp_alb.url}")
-        else:
-            print("\nNo such album on Spotify.")
-
-    else:
-        raise ValueError("Unsupported Yandex.Music URL. Provide /track/<id>, /artist/<id>, or /album/<id>.")
+    except Exception as e:
+        print("\nERROR:", repr(e))
 
 if __name__ == "__main__":
     main()
